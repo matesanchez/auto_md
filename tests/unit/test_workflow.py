@@ -48,12 +48,20 @@ def test_auto_inline_parser_normalizes_and_hashes():
 
 def test_auto_csv_parser(tmp_path):
     csv_path = tmp_path / "components.csv"
-    csv_path.write_text("smiles,ratio\nCCO,40\nCCCC,60\n", encoding="utf-8")
+    csv_path.write_text("local_id,name,smiles,ratio,role\nethanol,Ethanol,CCO,40,small_molecule\ndodecane,Dodecane,CCCCCCCCCCCC,60,additive\n", encoding="utf-8")
     parsed = core.parse_auto_input(str(csv_path))
     assert parsed["input_kind"] == "csv"
     assert parsed["source"] == str(csv_path)
     assert parsed["components"][0]["smiles"] == "CCO"
+    assert parsed["components"][0]["name"] == "Ethanol"
+    assert parsed["components"][0]["role"] == "small_molecule"
     assert parsed["components"][1]["raw_ratio"] == 60.0
+
+
+def test_auto_inline_parser_accepts_semicolon_and_newline():
+    parsed = core.parse_auto_input("CCO:25;CCCC:25\nCCCCCCCC:50")
+    assert parsed["validation"]["component_count"] == 3
+    assert [component["normalized_mol_fraction"] for component in parsed["components"]] == [0.25, 0.25, 0.5]
 
 
 def test_descriptors_parquet_loadable(tmp_path):
@@ -75,6 +83,30 @@ def test_auto_expands_minimal_input_and_freezes_raw_input(tmp_path):
     assert expanded["lipids"][0]["smiles"] == "CCO"
     assert expanded["lipids"][0]["role"] == "unknown"
     assert automation["raw_input"]["sha256"] == core.parse_auto_input("CCO:100")["sha256"]
+
+
+def test_auto_preserves_input_metadata_pipeline_trace_and_seed(tmp_path):
+    csv_path = tmp_path / "auto_metadata.csv"
+    csv_path.write_text(
+        "local_id,name,smiles,ratio,role\n"
+        "amine_lipid,Amine lipid,CCCCCCCCCCCCN(CCCCCCCC)CCCCCCCC,100,ionizable_lipid\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "auto_metadata"
+    report = core.command_auto(str(csv_path), str(out))
+    expanded = yaml.safe_load((out / "inputs" / "auto_expanded_formulation.yaml").read_text())
+    automation = yaml.safe_load((out / "manifests" / "automation_manifest.yaml").read_text())
+    build = yaml.safe_load((out / "manifests" / "build_manifest.yaml").read_text())
+    mdp = (out / "mdp" / "smoke_nvt.mdp").read_text()
+    production = yaml.safe_load((out / "manifests" / "production_plan_manifest.yaml").read_text())
+    assert report.exists()
+    assert expanded["lipids"][0]["name"] == "Amine lipid"
+    assert expanded["lipids"][0]["role"] == "ionizable_lipid"
+    assert [step["name"] for step in automation["pipeline_steps"]][-1] == "report"
+    assert build["reproducibility"]["random_seed"] == 12345
+    assert "gen-seed = 12345" in mdp
+    assert production["readiness"] == "blocked"
+    assert any(blocker["blocker_type"] == "placeholder_topology" for blocker in production["blockers"])
 
 
 def test_auto_role_inference_recognizes_sterol_peg_and_small_molecule():
@@ -371,6 +403,8 @@ def test_cli_help_subprocess():
     assert result.returncode == 0
     assert "workflow" in result.stdout
     assert "auto" in result.stdout
+    assert "production" in result.stdout
+    assert "features" in result.stdout
 
 
 def test_cli_audit_run_subprocess(tmp_path):
@@ -387,6 +421,36 @@ def test_batch_plan_and_summary(tmp_path):
     report = core.command_batch_summarize(str(Path(status).parent))
     assert report.exists()
     assert "completed" in report.read_text()
+
+
+def test_batch_auto_input_priority_features_and_summary(tmp_path):
+    batch_csv = tmp_path / "batch_auto.csv"
+    batch_csv.write_text(
+        "formulation_id,auto_input\n"
+        "\"auto_one\",\"CCCCCCCCCCCCN(CCCCCCCC)CCCCCCCC:100\"\n",
+        encoding="utf-8",
+    )
+    batch_dir = tmp_path / "batch_auto"
+    plan = core.command_batch_plan(str(batch_csv), str(batch_dir))
+    planned = yaml.safe_load(Path(plan).read_text())
+    assert planned["execution"]["supports_auto_input"] is True
+    assert planned["formulations"][0]["mode"] == "auto"
+    status = core.command_batch_smoke(str(plan), dry_run=True)
+    status_data = yaml.safe_load(Path(status).read_text())
+    run_dir = Path(status_data["formulations"][0]["run_dir"])
+    assert status_data["formulations"][0]["audit_status"] == "pass"
+    priority = core.command_prioritize([str(run_dir / "manifests" / "descriptor_manifest.yaml")], str(tmp_path / "priority"))
+    priority_data = yaml.safe_load(Path(priority).read_text())
+    assert priority_data["schema_version"] == "automd.priority_manifest.v0.2"
+    assert priority_data["rows"][0]["recommended_next_action"] == "production_plan"
+    features = core.command_features_build([str(batch_dir)], str(tmp_path / "features"))
+    feature_data = yaml.safe_load(Path(features).read_text())
+    assert feature_data["run_count"] == 1
+    assert feature_data["rows"][0]["qc_status"] == "pass"
+    summary = core.command_batch_summarize(str(batch_dir))
+    text = Path(summary).read_text()
+    assert "Readiness Counts" in text
+    assert "total recorded blockers" in text
 
 
 def test_custom_script_builder_requires_real_outputs(tmp_path):

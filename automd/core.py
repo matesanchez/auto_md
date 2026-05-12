@@ -265,20 +265,41 @@ def load_automation_policy(policy_path: str | None = None, allow_triage: bool = 
 
 
 def parse_auto_input(input_value: str) -> dict[str, Any]:
+    def normalize_component(component: dict[str, Any], idx: int) -> dict[str, Any]:
+        raw_ratio = component.get("raw_ratio", component.get("ratio", component.get("mol_fraction", component.get("mol_percent"))))
+        smiles = str(component.get("smiles") or component.get("SMILES") or "").strip()
+        if not smiles:
+            raise ValueError(f"Component {idx} is missing required SMILES")
+        try:
+            ratio = float(raw_ratio)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Component {idx} has invalid ratio: {raw_ratio}") from exc
+        if ratio < 0:
+            raise ValueError(f"Component {idx} ratio must be non-negative")
+        return {
+            "local_id": str(component.get("local_id") or component.get("id") or f"component_{idx:03d}"),
+            "name": str(component.get("name") or component.get("display_name") or component.get("local_id") or f"component_{idx:03d}"),
+            "smiles": smiles,
+            "raw_ratio": ratio,
+            "role": str(component.get("role") or "unknown"),
+            "topology_hint": component.get("topology_hint"),
+            "topology_source_hint": component.get("topology_source_hint"),
+            "topology_id": component.get("topology_id"),
+        }
+
     source_path = Path(input_value)
     if source_path.exists():
         raw = source_path.read_text(encoding="utf-8")
         suffix = source_path.suffix.lower()
         if suffix == ".csv":
             rows = list(csv.DictReader(raw.splitlines()))
-            components = [{"smiles": row.get("smiles") or row.get("SMILES"), "raw_ratio": row.get("ratio") or row.get("mol_fraction")} for row in rows]
+            components = rows
         elif suffix == ".json":
             loaded = json.loads(raw)
             components = loaded.get("components", loaded if isinstance(loaded, list) else [])
         elif suffix in {".yaml", ".yml"}:
             loaded = read_yaml(source_path)
             components = loaded.get("components", loaded.get("lipids", []))
-            components = [{"smiles": c.get("smiles"), "raw_ratio": c.get("ratio", c.get("mol_fraction", c.get("raw_ratio")))} for c in components]
         else:
             raise ValueError(f"Unsupported auto input file type: {source_path.suffix}")
         input_kind = suffix.lstrip(".")
@@ -286,10 +307,11 @@ def parse_auto_input(input_value: str) -> dict[str, Any]:
     else:
         raw = input_value
         components = []
-        for part in raw.split(","):
+        inline_parts: list[str] = []
+        for line in raw.replace(";", "\n").splitlines():
+            inline_parts.extend(part for part in line.split(",") if part.strip())
+        for part in inline_parts:
             part = part.strip()
-            if not part:
-                continue
             if ":" not in part:
                 raise ValueError(f"Malformed component '{part}'; expected SMILES:ratio")
             smiles, ratio = part.rsplit(":", 1)
@@ -298,19 +320,16 @@ def parse_auto_input(input_value: str) -> dict[str, Any]:
         source_label = "inline"
     normalized_components = []
     for idx, component in enumerate(components, start=1):
-        smiles = str(component.get("smiles") or "").strip()
-        if not smiles:
-            raise ValueError(f"Component {idx} is missing required SMILES")
-        try:
-            ratio = float(component.get("raw_ratio"))
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"Component {idx} has invalid ratio: {component.get('raw_ratio')}") from exc
-        if ratio < 0:
-            raise ValueError(f"Component {idx} ratio must be non-negative")
-        normalized_components.append({"local_id": f"component_{idx:03d}", "smiles": smiles, "raw_ratio": ratio})
+        normalized_components.append(normalize_component(component, idx))
     total = sum(c["raw_ratio"] for c in normalized_components)
     if total <= 0:
         raise ValueError("Auto input ratio total must be positive")
+    warnings = []
+    if any(c["raw_ratio"] == 0 for c in normalized_components):
+        warnings.append({"severity": "warning", "message": "one or more components has zero ratio and will be retained for provenance but contributes no molecules"})
+    duplicate_smiles = sorted({c["smiles"] for c in normalized_components if sum(1 for item in normalized_components if item["smiles"] == c["smiles"]) > 1})
+    if duplicate_smiles:
+        warnings.append({"severity": "warning", "message": "duplicate SMILES detected", "smiles": duplicate_smiles})
     for component in normalized_components:
         component["normalized_mol_fraction"] = component["raw_ratio"] / total
     return {
@@ -324,6 +343,7 @@ def parse_auto_input(input_value: str) -> dict[str, Any]:
             "interpreted_as": "auto_ratio",
             "normalized_to": "mol_fraction",
         },
+        "validation": {"component_count": len(normalized_components), "warnings": warnings},
         "components": normalized_components,
     }
 
@@ -1506,14 +1526,14 @@ def _run_custom_builder(template_manifest: dict[str, Any], run_dir: Path) -> dic
     }
 
 
-def _write_gromacs_ready_mdp(path: Path, step: str, nsteps: int) -> None:
+def _write_gromacs_ready_mdp(path: Path, step: str, nsteps: int, seed: int = 12345) -> None:
     integrator = "steep" if step == "em" else "md"
     md_extra = ""
     if step != "em":
         md_extra = (
             "gen-vel = yes\n"
             "gen-temp = 310\n"
-            "gen-seed = 12345\n"
+            f"gen-seed = {int(seed)}\n"
             "tcoupl = no\n"
         )
     path.write_text(
@@ -1552,6 +1572,7 @@ def command_build_smoke(template_manifest: str, builder: str = "mock") -> Path:
     for d in build_dirs:
         d.mkdir(parents=True, exist_ok=True)
     selected = review["reviewed_topologies"]
+    seed = int(tmpl.get("assumptions", {}).get("random_seed") or intake.get("simulation_request", {}).get("random_seed") or 12345)
     if builder == "custom_script":
         custom_result = _run_custom_builder(tmpl, run_dir)
         manifest = {
@@ -1561,6 +1582,7 @@ def command_build_smoke(template_manifest: str, builder: str = "mock") -> Path:
             "formulation_id": tmpl["formulation_id"],
             "template_manifest": str(template_manifest),
             "builder": {"name": builder, "version": "automd.custom_script_builder.v0.1", "mode": "external_command", "result": custom_result},
+            "reproducibility": {"random_seed": seed, "seed_source": "template_manifest.assumptions.random_seed"},
             "planned_composition": intake["lipids"],
             "artifacts": {
                 "system_gro": file_record(run_dir / "systems" / "system.gro", run_dir),
@@ -1621,7 +1643,7 @@ def command_build_smoke(template_manifest: str, builder: str = "mock") -> Path:
         encoding="utf-8",
     )
     for name, nsteps in [("em", 100), ("smoke_nvt", 250), ("smoke_npt", 250)]:
-        _write_gromacs_ready_mdp(run_dir / "mdp" / f"{name}.mdp", name, nsteps)
+        _write_gromacs_ready_mdp(run_dir / "mdp" / f"{name}.mdp", name, nsteps, seed)
     manifest = {
         "schema_version": "automd.build_manifest.v0.1",
         "created_at": utc_now(),
@@ -1629,6 +1651,7 @@ def command_build_smoke(template_manifest: str, builder: str = "mock") -> Path:
         "formulation_id": tmpl["formulation_id"],
         "template_manifest": str(template_manifest),
         "builder": {"name": builder, "version": "automd.mock_builder.v0.1", "mode": "mock_gromacs_ready"},
+        "reproducibility": {"random_seed": seed, "seed_source": "template_manifest.assumptions.random_seed"},
         "planned_composition": planned,
         "artifacts": {
             "system_gro": file_record(gro, run_dir),
@@ -1953,15 +1976,36 @@ def command_prioritize(manifests: list[str], out: str) -> Path:
         if "descriptor_coverage" in data:
             run_dir = Path(data["run_dir"])
             review_path = run_dir / "manifests" / "topology_review_manifest.yaml"
+            qc_path = run_dir / "manifests" / "qc_manifest.yaml"
+            metrics_path = run_dir / "manifests" / "metrics_manifest.yaml"
+            automation_path = run_dir / "manifests" / "automation_manifest.yaml"
             unresolved = read_yaml(review_path).get("unresolved_count", 1) if review_path.exists() else 1
+            qc = read_yaml(qc_path) if qc_path.exists() else {}
+            metrics = read_yaml(metrics_path) if metrics_path.exists() else {}
+            automation = read_yaml(automation_path) if automation_path.exists() else {}
+            blocker_count = len(automation.get("blockers", []))
             readiness = "smoke_ready" if unresolved == 0 else "descriptor_only"
-            score = 70 + 20 * data["descriptor_coverage"] if unresolved == 0 else 40 * data["descriptor_coverage"]
-            rows.append({"formulation_id": data["formulation_id"], "simulation_readiness": readiness, "priority_score": round(score, 2), "recommended_next_action": "run_smoke_test" if readiness == "smoke_ready" else "resolve_topology"})
+            score = 50 * float(data["descriptor_coverage"])
+            score += 30 if readiness == "smoke_ready" else 0
+            score += 15 if qc.get("qc_status") == "pass" else 0
+            score += 5 if metrics.get("quality_flags", {}).get("qualitative_only") is True else 0
+            score -= 25 * blocker_count
+            score = max(0.0, min(100.0, score))
+            rows.append({
+                "formulation_id": data["formulation_id"],
+                "run_dir": str(run_dir),
+                "descriptor_coverage": data["descriptor_coverage"],
+                "simulation_readiness": readiness,
+                "qc_status": qc.get("qc_status", "not_run"),
+                "blocker_count": blocker_count,
+                "priority_score": round(score, 2),
+                "recommended_next_action": "production_plan" if qc.get("qc_status") == "pass" else ("run_smoke_test" if readiness == "smoke_ready" else "resolve_topology"),
+            })
     outdir = Path(out)
     outdir.mkdir(parents=True, exist_ok=True)
     csv_path = outdir / "priority_table.csv"
     pd.DataFrame(rows).to_csv(csv_path, index=False)
-    manifest = write_yaml(outdir / "priority_manifest.yaml", {"schema_version": "automd.priority_manifest.v0.1", "created_at": utc_now(), "scoring_formula": "readiness + descriptor coverage v0", "priority_table": str(csv_path), "rows": rows})
+    manifest = write_yaml(outdir / "priority_manifest.yaml", {"schema_version": "automd.priority_manifest.v0.2", "created_at": utc_now(), "scoring_formula": "descriptor coverage + topology readiness + QC + metrics - blockers", "priority_table": str(csv_path), "rows": rows})
     print(manifest)
     return manifest
 
@@ -1973,14 +2017,18 @@ def command_batch_plan(csv_path: str, out: str) -> Path:
     with Path(csv_path).open(newline="", encoding="utf-8") as handle:
         for row in csv.DictReader(handle):
             input_path = row.get("path") or row.get("input_path")
+            auto_input = row.get("auto_input") or row.get("smiles_ratio") or row.get("components")
+            formulation_id = row.get("formulation_id") or row.get("id") or (Path(input_path).stem if input_path else f"auto_{len(formulations)+1:03d}")
             formulations.append({
-                "formulation_id": row.get("formulation_id") or row.get("id"),
+                "formulation_id": formulation_id,
                 "input_path": input_path,
+                "auto_input": auto_input,
+                "mode": "auto" if auto_input else "formulation_file",
                 "status": "planned",
                 "readiness": "unknown",
-                "run_dir": str(outdir / (row.get("formulation_id") or row.get("id") or Path(input_path or "formulation").stem)),
+                "run_dir": str(outdir / formulation_id),
             })
-    manifest = write_yaml(outdir / "batch_plan.yaml", {"schema_version": "automd.batch_manifest.v0.1", "batch_id": outdir.name, "created_at": utc_now(), "formulations": formulations, "execution": {"backend": "local", "max_parallel": 1}})
+    manifest = write_yaml(outdir / "batch_plan.yaml", {"schema_version": "automd.batch_manifest.v0.2", "batch_id": outdir.name, "created_at": utc_now(), "formulations": formulations, "execution": {"backend": "local", "max_parallel": 1, "supports_auto_input": True}})
     print(manifest)
     return manifest
 
@@ -1991,20 +2039,31 @@ def command_batch_smoke(batch_plan: str, dry_run: bool = False) -> Path:
     statuses = []
     for item in plan["formulations"]:
         input_path = item.get("input_path")
+        auto_input = item.get("auto_input")
         run_dir = item.get("run_dir") or str(outdir / str(item.get("formulation_id")))
-        if not input_path:
+        if not input_path and not auto_input:
             statuses.append({**item, "status": "failed", "failure": "missing_input_path"})
             continue
         try:
-            report = command_workflow(input_path, run_dir, dry_run=dry_run)
+            if auto_input:
+                report = command_auto(auto_input, run_dir, real_gromacs=not dry_run)
+            else:
+                report = command_workflow(input_path, run_dir, dry_run=dry_run)
             qc_path = Path(run_dir) / "manifests" / "qc_manifest.yaml"
+            review_path = Path(run_dir) / "manifests" / "topology_review_manifest.yaml"
+            automation_path = Path(run_dir) / "manifests" / "automation_manifest.yaml"
             qc = read_yaml(qc_path) if qc_path.exists() else {}
+            review = read_yaml(review_path) if review_path.exists() else {}
+            automation = read_yaml(automation_path) if automation_path.exists() else {}
+            audit = command_audit_run(run_dir)
             statuses.append({
                 **item,
                 "run_dir": run_dir,
                 "status": "completed",
-                "readiness": "smoke_ready" if qc.get("qc_status") == "pass" else "review_required",
+                "readiness": review.get("simulation_readiness", "smoke_ready" if qc.get("qc_status") == "pass" else "review_required"),
                 "qc_status": qc.get("qc_status"),
+                "audit_status": audit["status"],
+                "blocker_count": len(automation.get("blockers", [])),
                 "report": str(report),
             })
         except Exception as exc:
@@ -2019,10 +2078,23 @@ def command_batch_summarize(batch_dir: str) -> Path:
     status_path = batch_dir / "batch_status.yaml"
     data = read_yaml(status_path if status_path.exists() else batch_dir / "batch_plan.yaml")
     counts: dict[str, int] = {}
+    readiness_counts: dict[str, int] = {}
+    blocker_total = 0
     for item in data["formulations"]:
         counts[item["status"]] = counts.get(item["status"], 0) + 1
+        readiness = item.get("readiness", "unknown")
+        readiness_counts[readiness] = readiness_counts.get(readiness, 0) + 1
+        blocker_total += int(item.get("blocker_count") or 0)
     report = batch_dir / "batch_summary.md"
-    report.write_text("# AutoMD Batch Summary\n\n" + "\n".join(f"- {k}: {v}" for k, v in counts.items()) + "\n", encoding="utf-8")
+    report.write_text(
+        "# AutoMD Batch Summary\n\n"
+        "## Status Counts\n"
+        + "\n".join(f"- {k}: {v}" for k, v in counts.items())
+        + "\n\n## Readiness Counts\n"
+        + "\n".join(f"- {k}: {v}" for k, v in readiness_counts.items())
+        + f"\n\n## Blockers\n- total recorded blockers: {blocker_total}\n",
+        encoding="utf-8",
+    )
     print(report)
     return report
 
@@ -2053,6 +2125,8 @@ def command_report_run(run_dir: str) -> Path:
     manifests = {p.stem: read_yaml(p) for p in (run_dir / "manifests").glob("*.yaml")}
     metrics = manifests.get("metrics_manifest", {})
     qc = manifests.get("qc_manifest", {})
+    automation = manifests.get("automation_manifest", {})
+    production = manifests.get("production_plan_manifest", {})
     image_dir = run_dir / "images"
     image_dir.mkdir(exist_ok=True)
     coords = _parse_gro_coords(run_dir / "gromacs" / "smoke_npt.gro") if (run_dir / "gromacs" / "smoke_npt.gro").exists() else np.zeros((0, 3))
@@ -2081,6 +2155,13 @@ def command_report_run(run_dir: str) -> Path:
         f"- final structure: `gromacs/smoke_npt.gro`\n- trajectory: `gromacs/smoke_npt.xtc`\n- metrics: `{metrics.get('metrics_table', {}).get('path', 'not_generated')}`\n- rendered snapshot: `images/{png.name}`\n\n"
         "## QC\n"
         f"- grompp: {qc.get('qc_summary', {}).get('grompp_passed', 'not_run')}\n- mdrun: {qc.get('qc_summary', {}).get('smoke_mdrun_passed', 'not_run')}\n- energy sanity: {qc.get('qc_summary', {}).get('energy_sanity', {}).get('status', 'not_run')}\n- structure count: {qc.get('qc_summary', {}).get('structure_count_check', {}).get('status', 'not_run')}\n\n"
+        "## Automation Trace\n"
+        + ("\n".join(f"- {step.get('name')}: {step.get('status')}" for step in automation.get("pipeline_steps", [])) or "- not recorded")
+        + "\n\n## Blockers\n"
+        + ("\n".join(f"- {b.get('blocker_type')}: {b.get('reason')}" for b in automation.get("blockers", [])) or "- none recorded")
+        + "\n\n## Production Readiness\n"
+        + f"- status: {production.get('readiness', 'not_planned')}\n"
+        + f"- blockers: {len(production.get('blockers', []))}\n\n"
         "## Metrics\n"
         + "\n".join(f"- {name}: {value.get('value')} {value.get('unit', '')} ({value.get('status')})" for name, value in metrics.get("metrics", {}).items())
         + "\n\n## Caveats\nThis is a smoke workflow. Metrics are qualitative first-pass computed features and must not be interpreted as validated delivery predictions.\n",
@@ -2101,6 +2182,100 @@ def command_report_run(run_dir: str) -> Path:
 
 def command_report_batch(batch_dir: str) -> Path:
     return command_batch_summarize(batch_dir)
+
+
+def command_production_plan(run_dir: str, out: str | None = None) -> Path:
+    run = Path(run_dir)
+    review = read_yaml(run / "manifests" / "topology_review_manifest.yaml")
+    qc = read_yaml(run / "manifests" / "qc_manifest.yaml") if (run / "manifests" / "qc_manifest.yaml").exists() else {}
+    metrics = read_yaml(run / "manifests" / "metrics_manifest.yaml") if (run / "manifests" / "metrics_manifest.yaml").exists() else {}
+    blockers = []
+    production_ready = []
+    for item in review.get("reviewed_topologies", []):
+        selected = item.get("selected", {})
+        local_id = item.get("lipid", {}).get("local_id")
+        if not selected.get("topology_id"):
+            blockers.append({"blocker_type": "unresolved_topology", "component": local_id, "reason": "no selected topology"})
+        elif selected.get("placeholder_topology"):
+            blockers.append({"blocker_type": "placeholder_topology", "component": local_id, "reason": "placeholder topology cannot be production planned"})
+        elif selected.get("production_review_required") or not selected.get("production_eligible"):
+            blockers.append({"blocker_type": "production_review_required", "component": local_id, "reason": "topology is not production eligible"})
+        else:
+            production_ready.append(local_id)
+    if qc.get("qc_status") != "pass":
+        blockers.append({"blocker_type": "qc_not_passed", "component": None, "reason": "production planning requires passing smoke QC"})
+    manifest = {
+        "schema_version": "automd.production_plan_manifest.v0.1",
+        "created_at": utc_now(),
+        "run_dir": str(run),
+        "readiness": "production_ready" if not blockers else "blocked",
+        "production_ready_components": production_ready,
+        "blockers": blockers,
+        "source_manifests": {
+            "topology_review_manifest": "manifests/topology_review_manifest.yaml",
+            "qc_manifest": "manifests/qc_manifest.yaml" if qc else None,
+            "metrics_manifest": "manifests/metrics_manifest.yaml" if metrics else None,
+        },
+        "recommended_next_action": "prepare_long_run_manifest" if not blockers else "resolve production blockers before long simulations",
+        "caveat": "This is a production-readiness plan, not a production simulation.",
+    }
+    out_path = Path(out) if out else run / "manifests" / "production_plan_manifest.yaml"
+    path = write_yaml(out_path, manifest)
+    print(path)
+    return path
+
+
+def _run_feature_row(run: Path) -> dict[str, Any]:
+    manifests = run / "manifests"
+    intake = read_yaml(manifests / "intake_manifest.yaml") if (manifests / "intake_manifest.yaml").exists() else {}
+    desc = read_yaml(manifests / "descriptor_manifest.yaml") if (manifests / "descriptor_manifest.yaml").exists() else {}
+    review = read_yaml(manifests / "topology_review_manifest.yaml") if (manifests / "topology_review_manifest.yaml").exists() else {}
+    qc = read_yaml(manifests / "qc_manifest.yaml") if (manifests / "qc_manifest.yaml").exists() else {}
+    metrics = read_yaml(manifests / "metrics_manifest.yaml") if (manifests / "metrics_manifest.yaml").exists() else {}
+    automation = read_yaml(manifests / "automation_manifest.yaml") if (manifests / "automation_manifest.yaml").exists() else {}
+    metric_values = metrics.get("metrics", {})
+    return {
+        "formulation_id": intake.get("formulation_id") or desc.get("formulation_id") or run.name,
+        "run_dir": str(run),
+        "component_count": desc.get("formulation_descriptors", {}).get("component_count"),
+        "descriptor_coverage": desc.get("descriptor_coverage"),
+        "simulation_readiness": review.get("simulation_readiness"),
+        "unresolved_count": review.get("unresolved_count"),
+        "qc_status": qc.get("qc_status"),
+        "blocker_count": len(automation.get("blockers", [])),
+        "radius_of_gyration_nm": metric_values.get("radius_of_gyration_nm", {}).get("value"),
+        "diameter_proxy_nm": metric_values.get("diameter_proxy_nm", {}).get("value"),
+        "shape_anisotropy": metric_values.get("shape_anisotropy", {}).get("value"),
+        "qualitative_only": metrics.get("quality_flags", {}).get("qualitative_only"),
+    }
+
+
+def command_features_build(paths: list[str], out: str) -> Path:
+    outdir = Path(out)
+    outdir.mkdir(parents=True, exist_ok=True)
+    run_dirs: list[Path] = []
+    for raw in paths:
+        path = Path(raw)
+        if (path / "batch_status.yaml").exists():
+            batch = read_yaml(path / "batch_status.yaml")
+            run_dirs.extend(Path(item["run_dir"]) for item in batch.get("formulations", []) if item.get("run_dir"))
+        elif (path / "manifests").exists():
+            run_dirs.append(path)
+    rows = [_run_feature_row(run) for run in run_dirs]
+    table = outdir / "features.csv"
+    pd.DataFrame(rows).to_csv(table, index=False)
+    manifest = write_yaml(
+        outdir / "feature_manifest.yaml",
+        {
+            "schema_version": "automd.feature_manifest.v0.1",
+            "created_at": utc_now(),
+            "run_count": len(rows),
+            "features_table": file_record(table, outdir),
+            "rows": rows,
+        },
+    )
+    print(manifest)
+    return manifest
 
 
 def _resolve_audit_path(run: Path, path_value: str | None) -> Path | None:
@@ -2293,6 +2468,16 @@ def command_auto(input_value: str, out: str | None = None, real_gromacs: bool = 
     raw_path.write_text(auto_input["raw_input"], encoding="utf-8")
     policy_run_path = run_dir / "inputs" / "automation_policy.yaml"
     write_yaml(policy_run_path, policy)
+    pipeline_steps: list[dict[str, Any]] = []
+
+    def record_step(name: str, status: str, artifact: str | Path | None = None, **extra: Any) -> None:
+        step = {"name": name, "status": status, "recorded_at": utc_now()}
+        if artifact is not None:
+            step["artifact"] = str(artifact)
+        step.update(extra)
+        pipeline_steps.append(step)
+        _write_automation_manifest(run_dir, {"pipeline_steps": pipeline_steps})
+
     formulation = {
         "schema_version": "automd.formulation.v0.1",
         "formulation_id": run_id,
@@ -2302,10 +2487,13 @@ def command_auto(input_value: str, out: str | None = None, real_gromacs: bool = 
         "lipids": [
             {
                 "local_id": component["local_id"],
-                "name": component["local_id"],
+                "name": component.get("name") or component["local_id"],
                 "smiles": component["smiles"],
-                "role": "unknown",
+                "role": component.get("role") or "unknown",
                 "mol_fraction": component["raw_ratio"],
+                "topology_hint": component.get("topology_hint"),
+                "topology_source_hint": component.get("topology_source_hint"),
+                "topology_id": component.get("topology_id"),
             }
             for component in auto_input["components"]
         ],
@@ -2329,6 +2517,8 @@ def command_auto(input_value: str, out: str | None = None, real_gromacs: bool = 
             "policy": str(policy_run_path),
             "policy_snapshot": policy,
             "input_components": auto_input["components"],
+            "input_validation": auto_input["validation"],
+            "pipeline_steps": pipeline_steps,
             "blockers": [],
             "execution": {
                 "real_gromacs_requested": real_gromacs,
@@ -2339,9 +2529,12 @@ def command_auto(input_value: str, out: str | None = None, real_gromacs: bool = 
     )
     try:
         intake = command_intake(str(expanded), str(run_dir))
+        record_step("intake", "pass", intake)
         desc = command_descriptors(str(intake))
+        record_step("descriptors", "pass", desc)
         role_inference = apply_role_inference(str(desc), policy)
         automation_path = _write_automation_manifest(run_dir, {"role_inference": role_inference})
+        record_step("role_inference", "pass", desc)
         invalid_blockers = [
             {
                 "blocker_type": "invalid_or_missing_structure",
@@ -2353,14 +2546,18 @@ def command_auto(input_value: str, out: str | None = None, real_gromacs: bool = 
         if "invalid_or_missing_structure" in item.get("matched_rules", [])
     ]
         candidates = command_topology_generate(str(desc))
+        record_step("topology_generate", "pass", candidates)
         review, topology_decisions, topology_blockers = command_review_topology_auto(str(candidates), policy)
+        record_step("topology_review", "pass" if not topology_blockers else "blocked", review, blocker_count=len(topology_blockers))
         blockers = invalid_blockers + topology_blockers
         automation_path = _write_automation_manifest(run_dir, {"topology_decisions": topology_decisions, "blockers": blockers})
         template, template_decision = command_templates_recommend_auto(str(review), str(automation_path), policy)
+        record_step("template_selection", "pass" if template_decision["selected_template"] != "descriptor_only" else "blocked", template)
         proceed = not blockers and template_decision["selected_template"] != "descriptor_only"
         if real_gromacs and not shutil.which("gmx"):
             blockers.append({"blocker_type": "gromacs_unavailable", "component": None, "reason": "real GROMACS requested but gmx was not found", "next_action": "install/load GROMACS or rerun without --real-gromacs"})
             proceed = False
+            record_step("gromacs_availability", "blocked", None, reason="gmx not found")
         automation_path = _write_automation_manifest(
             run_dir,
             {
@@ -2374,19 +2571,31 @@ def command_auto(input_value: str, out: str | None = None, real_gromacs: bool = 
             },
         )
         if not proceed:
+            record_step("smoke_execution", "skipped", None, reason="blocked before smoke")
             return _write_auto_blocker_report(run_dir, str(automation_path))
         build = command_build_smoke(str(template), "mock")
+        record_step("build", "pass", build)
         command_gromacs_preflight(str(build))
+        record_step("gromacs_preflight", "pass", run_dir / "manifests" / "grompp_preflight_manifest.yaml")
         smoke = command_simulate_smoke(str(build), dry_run=not real_gromacs)
+        record_step("smoke_execution", "pass", smoke)
         qc = command_qc_smoke(str(smoke))
+        qc_status = read_yaml(qc).get("qc_status")
+        record_step("qc", "pass" if qc_status == "pass" else "failed", qc)
         command_metrics_extract(str(qc))
+        record_step("metrics", "pass", run_dir / "manifests" / "metrics_manifest.yaml")
+        production_plan = command_production_plan(str(run_dir))
+        record_step("production_plan", "pass", production_plan)
         automation_path = _write_automation_manifest(run_dir, {"execution": {"real_gromacs_requested": real_gromacs, "real_gromacs_available": bool(shutil.which("gmx")), "proceeded_to_smoke": True}})
-        return command_report_run(str(run_dir))
+        report = command_report_run(str(run_dir))
+        record_step("report", "pass", report)
+        return report
     except Exception as exc:
         automation = read_yaml(automation_path) if Path(automation_path).exists() else {}
         blockers = list(automation.get("blockers", []))
         blockers.append({"blocker_type": "automation_error", "component": None, "reason": str(exc), "next_action": "inspect generated manifests and rerun after fixing the reported issue"})
         automation_path = _write_automation_manifest(run_dir, {"blockers": blockers})
+        record_step("automation", "failed", None, reason=str(exc))
         return _write_auto_blocker_report(run_dir, str(automation_path))
 
 
@@ -2401,5 +2610,6 @@ def command_workflow(input_path: str, out: str | None = None, dry_run: bool = Tr
     smoke = command_simulate_smoke(str(build), dry_run=dry_run)
     qc = command_qc_smoke(str(smoke))
     command_metrics_extract(str(qc))
+    command_production_plan(str(Path(read_yaml(str(intake))["run_dir"])))
     report = command_report_run(str(Path(read_yaml(str(intake))["run_dir"])))
     return report
