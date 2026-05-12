@@ -501,6 +501,70 @@ def test_production_run_blocks_placeholder_without_explicit_allowance(tmp_path):
         core.command_production_run(str(run), dry_run=True, allow_placeholder=False)
 
 
+def test_topology_approval_promotes_reviewed_topologies_for_production_run(tmp_path):
+    run = tmp_path / "production_approved"
+    core.command_workflow("tests/fixtures/tiny_formulation.yaml", str(run), dry_run=True)
+    approvals = run / "topology" / "production_approvals.yaml"
+    approvals.write_text(
+        """
+approvals:
+  lipid_001:
+    approve_for_production: true
+    reviewer: test-curator
+    rationale: fixture topology accepted for production-path regression testing
+    approval_status: approved_exact
+  lipid_002:
+    approve_for_production: true
+    reviewer: test-curator
+    rationale: fixture topology accepted for production-path regression testing
+    approval_status: approved_exact
+""",
+        encoding="utf-8",
+    )
+    approval_manifest = core.command_topology_approve(str(run / "manifests" / "topology_review_manifest.yaml"), str(approvals))
+    approval = yaml.safe_load(approval_manifest.read_text())
+    report = core.command_production_run(str(run), dry_run=True, allow_placeholder=False)
+    plan = yaml.safe_load((run / "manifests" / "production_plan_manifest.yaml").read_text())
+    topology = yaml.safe_load((run / "manifests" / "production_topology_manifest.yaml").read_text())
+    assert approval["status"] == "pass"
+    assert report == run / "production" / "reports" / "production_report.md"
+    assert plan["readiness"] == "production_ready"
+    assert all(record["scientific_approval_status"] == "curated_production" for record in topology["topologies"])
+
+
+def test_auto_production_route_runs_with_explicit_software_validation(tmp_path):
+    run = tmp_path / "auto_production"
+    auto_input = tmp_path / "auto_input.yaml"
+    auto_input.write_text(
+        """
+components:
+  - name: MC3
+    smiles: CCN(CC)CCCC
+    ratio: 50
+    role: ionizable_lipid
+    topology_hint: MC3
+  - name: CHOL
+    smiles: C1CCC2C(C1)CCC3C2CCC4=CC(O)CCC34
+    ratio: 50
+    role: sterol
+    topology_hint: CHOL
+""",
+        encoding="utf-8",
+    )
+    report = core.command_auto(
+        str(auto_input),
+        str(run),
+        production=True,
+        allow_placeholder_production=True,
+    )
+    automation = yaml.safe_load((run / "manifests" / "automation_manifest.yaml").read_text())
+    audit = core.command_audit_run(str(run))
+    assert report == run / "production" / "reports" / "production_report.md"
+    assert automation["execution"]["production_requested"] is True
+    assert automation["execution"]["proceeded_to_production"] is True
+    assert audit["status"] == "pass"
+
+
 def test_custom_script_builder_requires_real_outputs(tmp_path):
     run = tmp_path / "custom"
     (run / "manifests").mkdir(parents=True)

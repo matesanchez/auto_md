@@ -1276,6 +1276,102 @@ def command_topology_validate(paths: list[str], out: str | None = None) -> Path:
     return path
 
 
+def _approval_entries(approvals_path: str) -> dict[str, dict[str, Any]]:
+    data = read_yaml(approvals_path)
+    entries = data.get("approvals", data) if isinstance(data, dict) else {}
+    if isinstance(entries, list):
+        normalized = {}
+        for entry in entries:
+            key = entry.get("local_id") or entry.get("component") or entry.get("topology_id")
+            if key:
+                normalized[str(key)] = entry
+        return normalized
+    if isinstance(entries, dict):
+        return {str(key): (value if isinstance(value, dict) else {"approve_for_production": bool(value)}) for key, value in entries.items()}
+    return {}
+
+
+def command_topology_approve(topology_review_manifest: str, approvals: str) -> Path:
+    review_path = Path(topology_review_manifest)
+    review = read_yaml(review_path)
+    run_dir = Path(review["run_dir"])
+    approval_map = _approval_entries(approvals)
+    records = []
+    blockers = []
+    for item in review.get("reviewed_topologies", []):
+        selected = item.get("selected", {})
+        local_id = item.get("lipid", {}).get("local_id")
+        approval = approval_map.get(str(local_id)) or approval_map.get(str(selected.get("topology_id")))
+        if not approval or not approval.get("approve_for_production", approval.get("approved", False)):
+            records.append({"component": local_id, "topology_id": selected.get("topology_id"), "approval_status": "not_requested"})
+            continue
+        reviewer = approval.get("reviewer")
+        rationale = approval.get("rationale")
+        if not reviewer or not rationale:
+            blockers.append({"component": local_id, "blocker_type": "approval_metadata_missing", "reason": "reviewer and rationale are required"})
+            continue
+        topology_files = selected.get("topology_files", [])
+        if not selected.get("topology_id") or not topology_files:
+            blockers.append({"component": local_id, "blocker_type": "topology_missing", "reason": "cannot production-approve descriptor-only or missing topology records"})
+            continue
+        validations = [validate_topology_file(topo["path"], selected.get("confidence_tier"), True) for topo in topology_files]
+        validation_passed = all(record.get("validation_status") == "pass" for record in validations)
+        if not validation_passed:
+            blockers.append({"component": local_id, "blocker_type": "topology_validation_failed", "reason": "all topology files must pass validation before production approval"})
+            records.append({"component": local_id, "topology_id": selected.get("topology_id"), "approval_status": "blocked", "validations": validations})
+            continue
+        approval_status = approval.get("approval_status", "user_curated_production")
+        selected["production_eligible"] = True
+        selected["allowed_for_production"] = True
+        selected["production_review_required"] = False
+        selected["placeholder_topology"] = False
+        selected["approval_status"] = approval_status
+        selected["production_approval"] = {
+            "approved_at": utc_now(),
+            "reviewer": reviewer,
+            "rationale": rationale,
+            "approval_status": approval_status,
+            "approval_source": str(approvals),
+            "validation_status": "pass",
+        }
+        item["review_status"] = "production_approved"
+        records.append({
+            "component": local_id,
+            "topology_id": selected.get("topology_id"),
+            "approval_status": approval_status,
+            "reviewer": reviewer,
+            "rationale": rationale,
+            "validations": validations,
+        })
+    reviewed = review.get("reviewed_topologies", [])
+    approved_count = sum(1 for item in reviewed if item.get("selected", {}).get("production_eligible") and not item.get("selected", {}).get("production_review_required"))
+    review["reviewed_topologies"] = reviewed
+    review["production_approval_manifest"] = "topology/production_topology_approval_manifest.yaml"
+    review["production_approval_summary"] = {
+        "approved_count": approved_count,
+        "total_count": len(reviewed),
+        "status": "all_components_production_approved" if approved_count == len(reviewed) and not blockers else "partial_or_blocked",
+    }
+    review["updated_at"] = utc_now()
+    write_yaml(review_path, review)
+    manifest = {
+        "schema_version": "automd.production_topology_approval_manifest.v0.1",
+        "created_at": utc_now(),
+        "run_dir": str(run_dir),
+        "topology_review_manifest": str(review_path),
+        "approvals": str(approvals),
+        "approved_count": approved_count,
+        "total_count": len(reviewed),
+        "records": records,
+        "blockers": blockers,
+        "status": "pass" if not blockers and approved_count == len(reviewed) else "blocked",
+        "caveat": "This command records an explicit curator approval gate; it does not infer scientific validity without reviewer/rationale and validation evidence.",
+    }
+    out = write_yaml(run_dir / "topology" / "production_topology_approval_manifest.yaml", manifest)
+    print(out)
+    return out
+
+
 def command_topology_resolve(descriptor_manifest: str) -> Path:
     desc = read_yaml(descriptor_manifest)
     run_dir = Path(desc["run_dir"])
@@ -1571,25 +1667,30 @@ def _write_gromacs_ready_mdp(path: Path, step: str, nsteps: int, seed: int = 123
 
 def _write_production_mdp(path: Path, step: str, nsteps: int, seed: int = 12345, checkpoint_interval: int = 1000) -> None:
     integrator = "steep" if step == "production_em" else "md"
-    continuation = "yes" if step in {"production_nvt", "production_npt", "production_md"} else "no"
+    continuation = "yes" if step in {"production_npt", "production_md"} else "no"
     coupling = ""
     if step != "production_em":
+        gen_vel = "yes" if step == "production_nvt" else "no"
         coupling = (
             "tcoupl = v-rescale\n"
             "tc-grps = System\n"
             "tau-t = 1.0\n"
             "ref-t = 310\n"
-            "pcoupl = berendsen\n"
-            "pcoupltype = isotropic\n"
-            "tau-p = 5.0\n"
-            "ref-p = 1.0\n"
-            "compressibility = 3e-4\n"
-            "gen-vel = yes\n"
+            f"gen-vel = {gen_vel}\n"
             "gen-temp = 310\n"
             f"gen-seed = {int(seed)}\n"
         )
-    if step == "production_md":
-        coupling = coupling.replace("pcoupl = berendsen", "pcoupl = Parrinello-Rahman")
+        if step == "production_nvt":
+            coupling += "pcoupl = no\n"
+        else:
+            coupling += (
+                "pcoupl = C-rescale\n"
+                "pcoupltype = isotropic\n"
+                "tau-p = 5.0\n"
+                "ref-p = 1.0\n"
+                "compressibility = 3e-4\n"
+                "refcoord-scaling = com\n"
+            )
     path.write_text(
         "; AutoMD production-stage MDP\n"
         f"integrator = {integrator}\n"
@@ -1613,7 +1714,7 @@ def _write_production_mdp(path: Path, step: str, nsteps: int, seed: int = 12345,
         "nstvout = 0\n"
         "nstfout = 0\n"
         "nstxout-compressed = 1000\n"
-        f"nstcheckpoint = {int(checkpoint_interval)}\n"
+        f"; checkpoint_interval_steps = {int(checkpoint_interval)}\n"
         f"{coupling}",
         encoding="utf-8",
     )
@@ -2291,8 +2392,7 @@ def command_production_prepare_topologies(run_dir: str, allow_placeholder: bool 
 def command_production_plan(run_dir: str, out: str | None = None, allow_placeholder: bool = False) -> Path:
     run = Path(run_dir)
     topology_manifest_path = run / "manifests" / "production_topology_manifest.yaml"
-    if not topology_manifest_path.exists():
-        command_production_prepare_topologies(str(run), allow_placeholder=allow_placeholder)
+    command_production_prepare_topologies(str(run), allow_placeholder=allow_placeholder)
     topology_manifest = read_yaml(topology_manifest_path) if topology_manifest_path.exists() else {}
     review = read_yaml(run / "manifests" / "topology_review_manifest.yaml")
     qc = read_yaml(run / "manifests" / "qc_manifest.yaml") if (run / "manifests" / "qc_manifest.yaml").exists() else {}
@@ -2902,7 +3002,7 @@ def command_audit_run(run_dir: str) -> dict[str, Any]:
                 issues.append({"check": "placeholder_not_production", "local_id": local_id, "status": "fail"})
             if selected.get("confidence_tier") == "C_generated_from_approved_fragments" and selected.get("production_eligible"):
                 issues.append({"check": "generated_c_not_production", "local_id": local_id, "status": "fail"})
-            if selected.get("allowed_for_smoke") and selected.get("production_eligible"):
+            if selected.get("allowed_for_smoke") and selected.get("production_eligible") and not selected.get("production_approval"):
                 issues.append({"check": "smoke_and_production_separated", "local_id": local_id, "status": "warn", "message": "Topology is both smoke- and production-eligible; verify it is curated."})
             for idx, record in enumerate(selected.get("topology_files", []), start=1):
                 _audit_file_record(run, issues, f"selected_topology:{local_id}:{idx}", record)
@@ -3034,14 +3134,28 @@ def _write_auto_blocker_report(run_dir: Path, automation_manifest: str) -> Path:
 def _write_automation_manifest(run_dir: Path, data: dict[str, Any]) -> Path:
     existing_path = run_dir / "manifests" / "automation_manifest.yaml"
     existing = read_yaml(existing_path) if existing_path.exists() else {}
-    merged = {**existing, **data}
+    merged = dict(existing)
+    for key, value in data.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = {**merged[key], **value}
+        else:
+            merged[key] = value
     merged.setdefault("schema_version", "automd.automation_manifest.v0.1")
     merged.setdefault("created_at", utc_now())
     merged["updated_at"] = utc_now()
     return write_yaml(existing_path, merged)
 
 
-def command_auto(input_value: str, out: str | None = None, real_gromacs: bool = False, allow_triage: bool = False, policy_path: str | None = None) -> Path:
+def command_auto(
+    input_value: str,
+    out: str | None = None,
+    real_gromacs: bool = False,
+    allow_triage: bool = False,
+    policy_path: str | None = None,
+    production: bool = False,
+    production_profile: str = "local_cpu",
+    allow_placeholder_production: bool = False,
+) -> Path:
     policy = load_automation_policy(policy_path, allow_triage=allow_triage, real_gromacs=real_gromacs)
     auto_input = parse_auto_input(input_value)
     run_id = f"auto_{auto_input['sha256'][:12]}"
@@ -3108,6 +3222,9 @@ def command_auto(input_value: str, out: str | None = None, real_gromacs: bool = 
             "execution": {
                 "real_gromacs_requested": real_gromacs,
                 "real_gromacs_available": bool(shutil.which("gmx")),
+                "production_requested": production,
+                "production_profile": production_profile,
+                "allow_placeholder_production": allow_placeholder_production,
                 "proceeded_to_smoke": False,
             },
         },
@@ -3171,9 +3288,42 @@ def command_auto(input_value: str, out: str | None = None, real_gromacs: bool = 
         record_step("metrics", "pass", run_dir / "manifests" / "metrics_manifest.yaml")
         production_plan = command_production_plan(str(run_dir))
         record_step("production_plan", "pass", production_plan)
-        automation_path = _write_automation_manifest(run_dir, {"execution": {"real_gromacs_requested": real_gromacs, "real_gromacs_available": bool(shutil.which("gmx")), "proceeded_to_smoke": True}})
+        automation_path = _write_automation_manifest(
+            run_dir,
+            {
+                "execution": {
+                    "real_gromacs_requested": real_gromacs,
+                    "real_gromacs_available": bool(shutil.which("gmx")),
+                    "production_requested": production,
+                    "production_profile": production_profile,
+                    "allow_placeholder_production": allow_placeholder_production,
+                    "proceeded_to_smoke": True,
+                }
+            },
+        )
         report = command_report_run(str(run_dir))
         record_step("report", "pass", report)
+        if production:
+            try:
+                production_report = command_production_run(
+                    str(run_dir),
+                    dry_run=not real_gromacs,
+                    profile=production_profile,
+                    allow_placeholder=allow_placeholder_production,
+                    auto_generate=False,
+                )
+                record_step("production_run", "pass", production_report)
+                _write_automation_manifest(run_dir, {"execution": {"proceeded_to_production": True}})
+                return production_report
+            except RuntimeError as exc:
+                blockers.append({
+                    "blocker_type": "production_blocked",
+                    "component": None,
+                    "reason": str(exc),
+                    "next_action": "approve curated topologies with `automd topology approve` or rerun with --allow-placeholder-production for software validation only",
+                })
+                _write_automation_manifest(run_dir, {"blockers": blockers, "execution": {"proceeded_to_production": False}})
+                record_step("production_run", "blocked", None, reason=str(exc))
         return report
     except Exception as exc:
         automation = read_yaml(automation_path) if Path(automation_path).exists() else {}

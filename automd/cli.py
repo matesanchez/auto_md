@@ -35,6 +35,9 @@ def build_parser() -> argparse.ArgumentParser:
     auto.add_argument("--real-gromacs", action="store_true")
     auto.add_argument("--allow-triage", action="store_true")
     auto.add_argument("--policy")
+    auto.add_argument("--production", action="store_true", help="After smoke/QC, attempt the production lifecycle")
+    auto.add_argument("--production-profile", default="local_cpu")
+    auto.add_argument("--allow-placeholder-production", action="store_true", help="Run production software validation with non-curated topologies")
 
     intake = sub.add_parser("intake")
     intake.add_argument("input")
@@ -57,6 +60,9 @@ def build_parser() -> argparse.ArgumentParser:
     topo_validate = topo_sub.add_parser("validate")
     topo_validate.add_argument("topology_files", nargs="+")
     topo_validate.add_argument("--out")
+    topo_approve = topo_sub.add_parser("approve")
+    topo_approve.add_argument("topology_review_manifest")
+    topo_approve.add_argument("--approvals", required=True)
 
     review = sub.add_parser("review")
     review_sub = review.add_subparsers(dest="review_cmd")
@@ -177,7 +183,16 @@ def main(argv: list[str] | None = None) -> int:
         elif args.cmd == "sources" and args.sources_cmd == "fetch":
             core.command_sources_fetch(args.all)
         elif args.cmd == "auto":
-            core.command_auto(args.input, args.out, args.real_gromacs, args.allow_triage, args.policy)
+            core.command_auto(
+                args.input,
+                args.out,
+                args.real_gromacs,
+                args.allow_triage,
+                args.policy,
+                production=args.production,
+                production_profile=args.production_profile,
+                allow_placeholder_production=args.allow_placeholder_production,
+            )
         elif args.cmd == "intake":
             core.command_intake(args.input, args.out)
         elif args.cmd == "descriptors" and args.desc_cmd == "run":
@@ -190,6 +205,8 @@ def main(argv: list[str] | None = None) -> int:
             core.command_topology_generate(args.descriptor_manifest)
         elif args.cmd == "topology" and args.topo_cmd == "validate":
             core.command_topology_validate(args.topology_files, args.out)
+        elif args.cmd == "topology" and args.topo_cmd == "approve":
+            core.command_topology_approve(args.topology_review_manifest, args.approvals)
         elif args.cmd == "review" and args.review_cmd == "topology":
             core.command_review_topology(args.topology_candidates, args.answers)
         elif args.cmd == "templates" and args.templates_cmd == "list":
