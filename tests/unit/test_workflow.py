@@ -453,6 +453,54 @@ def test_batch_auto_input_priority_features_and_summary(tmp_path):
     assert "total recorded blockers" in text
 
 
+def test_production_run_autogenerates_missing_prerequisites_and_contract(tmp_path):
+    run = tmp_path / "production_auto_generate"
+    core.command_intake("tests/fixtures/tiny_formulation.yaml", str(run))
+    report = core.command_production_run(str(run), dry_run=True, profile="local_cpu", allow_placeholder=True)
+    assert report == run / "production" / "reports" / "production_report.md"
+    expected_manifests = [
+        "descriptor_manifest.yaml",
+        "topology_review_manifest.yaml",
+        "qc_manifest.yaml",
+        "metrics_manifest.yaml",
+        "production_topology_manifest.yaml",
+        "production_plan_manifest.yaml",
+        "production_profile_manifest.yaml",
+        "production_build_manifest.yaml",
+        "production_run_manifest.yaml",
+        "production_qc_manifest.yaml",
+        "production_metrics_manifest.yaml",
+        "production_report_manifest.yaml",
+    ]
+    for name in expected_manifests:
+        assert (run / "manifests" / name).exists()
+    plan = yaml.safe_load((run / "manifests" / "production_plan_manifest.yaml").read_text())
+    topology = yaml.safe_load((run / "manifests" / "production_topology_manifest.yaml").read_text())
+    build = yaml.safe_load((run / "manifests" / "production_build_manifest.yaml").read_text())
+    production_run = yaml.safe_load((run / "manifests" / "production_run_manifest.yaml").read_text())
+    production_qc = yaml.safe_load((run / "manifests" / "production_qc_manifest.yaml").read_text())
+    production_metrics = yaml.safe_load((run / "manifests" / "production_metrics_manifest.yaml").read_text())
+    profile = yaml.safe_load((run / "manifests" / "production_profile_manifest.yaml").read_text())
+    audit = core.command_audit_run(str(run))
+    assert plan["readiness"] == "production_runnable_software_validation"
+    assert topology["allow_placeholder_for_software_validation"] is True
+    assert build["stage_steps"]["production_md"] > build["stage_steps"]["production_npt"]
+    assert production_run["stages"] == ["production_em", "production_nvt", "production_npt", "production_md"]
+    assert production_qc["qc_summary"]["trajectory_integrity"]["passed"] is True
+    assert production_qc["qc_summary"]["checkpoint_integrity"]["passed"] is True
+    assert "composition_distribution" in production_metrics["metrics"]
+    assert "replicate_summary" in production_metrics["metrics"]
+    assert profile["checkpoint_policy"]["enabled"] is True
+    assert audit["status"] == "pass"
+
+
+def test_production_run_blocks_placeholder_without_explicit_allowance(tmp_path):
+    run = tmp_path / "production_blocked"
+    core.command_workflow("tests/fixtures/tiny_formulation.yaml", str(run), dry_run=True)
+    with pytest.raises(RuntimeError, match="Production pipeline blocked"):
+        core.command_production_run(str(run), dry_run=True, allow_placeholder=False)
+
+
 def test_custom_script_builder_requires_real_outputs(tmp_path):
     run = tmp_path / "custom"
     (run / "manifests").mkdir(parents=True)

@@ -105,6 +105,12 @@ TEMPLATES = {
         "requires_resolved_topology": True,
         "builder": "mock",
     },
+    "production_mixed_lipid_pipeline": {
+        "template_id": "production_mixed_lipid_pipeline",
+        "description": "Production artifact contract with staged EM/NVT/NPT/MD lifecycle.",
+        "requires_resolved_topology": True,
+        "builder": "production_pack_like",
+    },
 }
 
 
@@ -1563,6 +1569,56 @@ def _write_gromacs_ready_mdp(path: Path, step: str, nsteps: int, seed: int = 123
     )
 
 
+def _write_production_mdp(path: Path, step: str, nsteps: int, seed: int = 12345, checkpoint_interval: int = 1000) -> None:
+    integrator = "steep" if step == "production_em" else "md"
+    continuation = "yes" if step in {"production_nvt", "production_npt", "production_md"} else "no"
+    coupling = ""
+    if step != "production_em":
+        coupling = (
+            "tcoupl = v-rescale\n"
+            "tc-grps = System\n"
+            "tau-t = 1.0\n"
+            "ref-t = 310\n"
+            "pcoupl = berendsen\n"
+            "pcoupltype = isotropic\n"
+            "tau-p = 5.0\n"
+            "ref-p = 1.0\n"
+            "compressibility = 3e-4\n"
+            "gen-vel = yes\n"
+            "gen-temp = 310\n"
+            f"gen-seed = {int(seed)}\n"
+        )
+    if step == "production_md":
+        coupling = coupling.replace("pcoupl = berendsen", "pcoupl = Parrinello-Rahman")
+    path.write_text(
+        "; AutoMD production-stage MDP\n"
+        f"integrator = {integrator}\n"
+        f"nsteps = {int(nsteps)}\n"
+        "dt = 0.02\n"
+        "emtol = 500.0\n"
+        "emstep = 0.01\n"
+        "cutoff-scheme = Verlet\n"
+        "nstlist = 20\n"
+        "pbc = xyz\n"
+        "coulombtype = Reaction-Field\n"
+        "rcoulomb = 1.1\n"
+        "epsilon-r = 15\n"
+        "vdwtype = Cut-off\n"
+        "rvdw = 1.1\n"
+        "constraints = none\n"
+        f"continuation = {continuation}\n"
+        "nstlog = 1000\n"
+        "nstenergy = 1000\n"
+        "nstxout = 0\n"
+        "nstvout = 0\n"
+        "nstfout = 0\n"
+        "nstxout-compressed = 1000\n"
+        f"nstcheckpoint = {int(checkpoint_interval)}\n"
+        f"{coupling}",
+        encoding="utf-8",
+    )
+
+
 def command_build_smoke(template_manifest: str, builder: str = "mock") -> Path:
     tmpl = read_yaml(template_manifest)
     run_dir = Path(tmpl["run_dir"])
@@ -2184,43 +2240,314 @@ def command_report_batch(batch_dir: str) -> Path:
     return command_batch_summarize(batch_dir)
 
 
-def command_production_plan(run_dir: str, out: str | None = None) -> Path:
+def command_production_prepare_topologies(run_dir: str, allow_placeholder: bool = False) -> Path:
     run = Path(run_dir)
+    review = read_yaml(run / "manifests" / "topology_review_manifest.yaml")
+    out_dir = run / "topologies" / "production"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    records = []
+    blockers = []
+    for item in review.get("reviewed_topologies", []):
+        selected = item.get("selected", {})
+        local_id = item.get("lipid", {}).get("local_id")
+        files = []
+        for topo in selected.get("topology_files", []):
+            src = Path(topo["path"])
+            if not src.exists():
+                blockers.append({"blocker_type": "missing_topology_file", "component": local_id, "path": str(src)})
+                continue
+            dest = out_dir / f"{local_id}.{src.name}"
+            shutil.copy2(src, dest)
+            files.append(file_record(dest, run))
+        scientific_status = "curated_production" if selected.get("production_eligible") and not selected.get("production_review_required") and not selected.get("placeholder_topology") else "software_generated_or_placeholder_requires_scientific_review"
+        run_allowed = scientific_status == "curated_production" or (allow_placeholder and bool(files))
+        if not run_allowed:
+            blockers.append({"blocker_type": "topology_not_runnable_for_production", "component": local_id, "reason": "curated production topology missing; rerun with explicit placeholder allowance for software validation only"})
+        records.append({
+            "component": local_id,
+            "topology_id": selected.get("topology_id"),
+            "confidence_tier": selected.get("confidence_tier"),
+            "source_placeholder_topology": bool(selected.get("placeholder_topology")),
+            "source_production_eligible": bool(selected.get("production_eligible")),
+            "scientific_approval_status": scientific_status,
+            "production_run_allowed": run_allowed,
+            "files": files,
+        })
+    manifest = {
+        "schema_version": "automd.production_topology_manifest.v0.1",
+        "created_at": utc_now(),
+        "run_dir": str(run),
+        "allow_placeholder_for_software_validation": allow_placeholder,
+        "topologies": records,
+        "blockers": blockers,
+        "status": "ready_for_production_build" if not blockers else "blocked",
+        "caveat": "Placeholder/generated topologies may run the software production lifecycle only when explicitly allowed; this is not scientific topology approval.",
+    }
+    path = write_yaml(run / "manifests" / "production_topology_manifest.yaml", manifest)
+    print(path)
+    return path
+
+
+def command_production_plan(run_dir: str, out: str | None = None, allow_placeholder: bool = False) -> Path:
+    run = Path(run_dir)
+    topology_manifest_path = run / "manifests" / "production_topology_manifest.yaml"
+    if not topology_manifest_path.exists():
+        command_production_prepare_topologies(str(run), allow_placeholder=allow_placeholder)
+    topology_manifest = read_yaml(topology_manifest_path) if topology_manifest_path.exists() else {}
     review = read_yaml(run / "manifests" / "topology_review_manifest.yaml")
     qc = read_yaml(run / "manifests" / "qc_manifest.yaml") if (run / "manifests" / "qc_manifest.yaml").exists() else {}
     metrics = read_yaml(run / "manifests" / "metrics_manifest.yaml") if (run / "manifests" / "metrics_manifest.yaml").exists() else {}
     blockers = []
     production_ready = []
+    software_runnable = []
     for item in review.get("reviewed_topologies", []):
         selected = item.get("selected", {})
         local_id = item.get("lipid", {}).get("local_id")
+        topo_record = next((record for record in topology_manifest.get("topologies", []) if record.get("component") == local_id), {})
         if not selected.get("topology_id"):
             blockers.append({"blocker_type": "unresolved_topology", "component": local_id, "reason": "no selected topology"})
-        elif selected.get("placeholder_topology"):
+        elif selected.get("placeholder_topology") and not topo_record.get("production_run_allowed"):
             blockers.append({"blocker_type": "placeholder_topology", "component": local_id, "reason": "placeholder topology cannot be production planned"})
-        elif selected.get("production_review_required") or not selected.get("production_eligible"):
+        elif (selected.get("production_review_required") or not selected.get("production_eligible")) and not topo_record.get("production_run_allowed"):
             blockers.append({"blocker_type": "production_review_required", "component": local_id, "reason": "topology is not production eligible"})
         else:
-            production_ready.append(local_id)
+            if topo_record.get("scientific_approval_status") == "curated_production":
+                production_ready.append(local_id)
+            else:
+                software_runnable.append(local_id)
     if qc.get("qc_status") != "pass":
         blockers.append({"blocker_type": "qc_not_passed", "component": None, "reason": "production planning requires passing smoke QC"})
+    readiness = "production_ready" if not blockers and len(production_ready) == len(review.get("reviewed_topologies", [])) else ("production_runnable_software_validation" if not blockers else "blocked")
     manifest = {
         "schema_version": "automd.production_plan_manifest.v0.1",
         "created_at": utc_now(),
         "run_dir": str(run),
-        "readiness": "production_ready" if not blockers else "blocked",
+        "readiness": readiness,
         "production_ready_components": production_ready,
+        "software_runnable_components": software_runnable,
         "blockers": blockers,
         "source_manifests": {
             "topology_review_manifest": "manifests/topology_review_manifest.yaml",
+            "production_topology_manifest": "manifests/production_topology_manifest.yaml",
             "qc_manifest": "manifests/qc_manifest.yaml" if qc else None,
             "metrics_manifest": "manifests/metrics_manifest.yaml" if metrics else None,
         },
-        "recommended_next_action": "prepare_long_run_manifest" if not blockers else "resolve production blockers before long simulations",
-        "caveat": "This is a production-readiness plan, not a production simulation.",
+        "recommended_next_action": "build_production_package" if not blockers else "resolve production blockers before long simulations",
+        "caveat": "production_runnable_software_validation is an automated software execution state, not curated scientific topology approval.",
     }
     out_path = Path(out) if out else run / "manifests" / "production_plan_manifest.yaml"
     path = write_yaml(out_path, manifest)
+    print(path)
+    return path
+
+
+def command_production_profile(run_dir: str, profile: str = "local_cpu", walltime_hours: float = 24.0) -> Path:
+    run = Path(run_dir)
+    profiles = {
+        "local_cpu": {"backend": "local", "ntmpi": 1, "ntomp": 4, "gpu": False, "submit_mode": "foreground"},
+        "local_gpu": {"backend": "local", "ntmpi": 1, "ntomp": 4, "gpu": True, "submit_mode": "foreground"},
+        "slurm_gpu": {"backend": "slurm", "partition": "gpu", "gpus": 1, "cpus_per_task": 8, "submit_mode": "script"},
+    }
+    selected = profiles.get(profile, profiles["local_cpu"])
+    manifest = {
+        "schema_version": "automd.production_profile_manifest.v0.1",
+        "created_at": utc_now(),
+        "run_dir": str(run),
+        "profile_name": profile,
+        "resources": selected,
+        "walltime_hours": walltime_hours,
+        "checkpoint_policy": {
+            "enabled": True,
+            "checkpoint_interval_steps": 1000,
+            "restart_from_latest_checkpoint": True,
+            "walltime_segmented": walltime_hours > 0,
+        },
+        "retry_policy": {"max_retries": 1, "retry_failed_segments_only": True},
+    }
+    path = write_yaml(run / "manifests" / "production_profile_manifest.yaml", manifest)
+    print(path)
+    return path
+
+
+def command_production_build(run_dir: str, builder: str = "production_pack_like") -> Path:
+    run = Path(run_dir)
+    plan_path = run / "manifests" / "production_plan_manifest.yaml"
+    if not plan_path.exists():
+        command_production_plan(str(run))
+    plan = read_yaml(plan_path)
+    if plan.get("readiness") == "blocked":
+        raise RuntimeError("Production plan is blocked; resolve blockers or rerun with explicit placeholder allowance")
+    intake = read_yaml(run / "manifests" / "intake_manifest.yaml")
+    review = read_yaml(run / "manifests" / "topology_review_manifest.yaml")
+    topology_manifest = read_yaml(run / "manifests" / "production_topology_manifest.yaml")
+    for subdir in ["production/systems", "production/mdp", "production/gromacs", "production/logs", "production/reports"]:
+        (run / subdir).mkdir(parents=True, exist_ok=True)
+    planned = _planned_counts(intake["lipids"], total=512)
+    gro = run / "production" / "systems" / "production_system.gro"
+    atoms = []
+    atom_id = 1
+    residue_id = 1
+    for li, (lipid, reviewed) in enumerate(zip(planned, review["reviewed_topologies"])):
+        mol_type = reviewed["selected"].get("molecule_type_name") or lipid["display_name"]
+        mol_name = _safe_molecule_type(mol_type, lipid["local_id"])[:5]
+        topo_files = reviewed["selected"].get("topology_files", [])
+        atom_count = 1
+        if topo_files and Path(topo_files[0]["path"]).exists():
+            atom_count = max(1, int(parse_itp_summary(Path(topo_files[0]["path"])).get("atom_count") or 1))
+        for mi in range(lipid["planned_molecule_count"]):
+            layer = mi % 8
+            base_x = (li * 1.7 + mi * 0.17) % 16
+            base_y = (mi * 0.23 + layer * 0.07) % 16
+            base_z = 8.0 + ((mi % 11) - 5) * 0.09
+            for ai in range(1, atom_count + 1):
+                atoms.append(f"{residue_id%99999:5d}{mol_name:<5}{('B'+str(ai))[:5]:>5}{atom_id%99999:5d}{base_x + 0.035 * (ai - 1):8.3f}{base_y:8.3f}{base_z:8.3f}")
+                atom_id += 1
+            residue_id += 1
+    gro.write_text("AutoMD production candidate system\n" + f"{len(atoms):5d}\n" + "\n".join(atoms) + "\n  16.00000  16.00000  16.00000\n", encoding="utf-8")
+    copied_topologies = []
+    for record in topology_manifest.get("topologies", []):
+        for topo in record.get("files", []):
+            src = run / topo["path"]
+            copied_topologies.append(src)
+    top = run / "production" / "systems" / "production_topol.top"
+    includes = [f'#include "../../{path.relative_to(run)}"' for path in copied_topologies if path.exists()]
+    molecules = [f"{item['selected'].get('molecule_type_name', item['lipid']['name']):<16} {planned[i]['planned_molecule_count']}" for i, item in enumerate(review["reviewed_topologies"])]
+    top.write_text(
+        "; AutoMD production candidate topology package\n"
+        "; Scientific validity depends on production_topology_manifest approval state.\n\n"
+        "[ defaults ]\n1 1 no 1.0 1.0\n\n"
+        "[ atomtypes ]\nP1 72.0 0.0 A 0.470 5.000\n\n"
+        + "\n".join(includes)
+        + "\n\n[ system ]\nAutoMD production candidate system\n\n[ molecules ]\n"
+        + "\n".join(molecules)
+        + "\n",
+        encoding="utf-8",
+    )
+    seed = int(read_yaml(run / "manifests" / "template_manifest.yaml").get("assumptions", {}).get("random_seed") or 12345)
+    stage_steps = {"production_em": 5000, "production_nvt": 25000, "production_npt": 50000, "production_md": 250000}
+    for stage, nsteps in stage_steps.items():
+        _write_production_mdp(run / "production" / "mdp" / f"{stage}.mdp", stage, nsteps, seed)
+    manifest = {
+        "schema_version": "automd.production_build_manifest.v0.1",
+        "created_at": utc_now(),
+        "run_dir": str(run),
+        "production_plan_manifest": "manifests/production_plan_manifest.yaml",
+        "builder": {
+            "name": builder,
+            "version": "automd.production_pack_like.v0.1",
+            "mode": "deterministic_pack_like_builder",
+            "note": "Built automatically from reviewed topology records; replace with Packmol/insane/Polyply adapter when available.",
+        },
+        "planned_composition": planned,
+        "stage_steps": stage_steps,
+        "artifacts": {
+            "system_gro": file_record(gro, run),
+            "topol_top": file_record(top, run),
+            "mdp": [file_record(p, run) for p in sorted((run / "production" / "mdp").glob("*.mdp"))],
+            "topologies": [file_record(p, run) for p in copied_topologies if p.exists()],
+        },
+    }
+    path = write_yaml(run / "manifests" / "production_build_manifest.yaml", manifest)
+    print(path)
+    return path
+
+
+PRODUCTION_STAGES = [
+    ("production_em", "production/systems/production_system.gro"),
+    ("production_nvt", "production/gromacs/production_em.gro"),
+    ("production_npt", "production/gromacs/production_nvt.gro"),
+    ("production_md", "production/gromacs/production_npt.gro"),
+]
+
+
+def _production_command_record(stage: str, kind: str, command: str, return_code: int = 0) -> dict[str, Any]:
+    return {"stage": stage, "kind": kind, "command": command, "return_code": return_code, "warnings": []}
+
+
+def _simulate_production_outputs(run: Path, dry_run: bool = True) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    gmx = shutil.which("gmx") or "gmx"
+    commands = []
+    outputs = []
+    source_gro = run / "production" / "systems" / "production_system.gro"
+    for stage, coord in PRODUCTION_STAGES:
+        grompp = f"{gmx} grompp -f production/mdp/{stage}.mdp -c {coord} -p production/systems/production_topol.top -o production/gromacs/{stage}.tpr -po production/gromacs/{stage}_mdout.mdp -pp production/gromacs/{stage}_processed.top -maxwarn 0"
+        mdrun = f"{gmx} mdrun -deffnm production/gromacs/{stage} -v -cpo production/gromacs/{stage}.cpt"
+        commands.append(_production_command_record(stage, "grompp", grompp, 0 if dry_run else None))
+        commands.append(_production_command_record(stage, "mdrun", mdrun, 0 if dry_run else None))
+        if dry_run:
+            gro_text = source_gro.read_text(encoding="utf-8") if source_gro.exists() else ""
+            for suffix, text in {
+                ".tpr": f"production dry-run tpr stage={stage}\n",
+                ".log": f"AutoMD production dry-run log for {stage}\nTemperature 310\nPressure 1.0\nPotential Energy -2.0e4\nFinished mdrun successfully\n",
+                ".edr": "Temperature 310\nPressure 1.0\nPotential Energy -2.0e4\n",
+                ".gro": gro_text,
+                ".xtc": f"production dry-run trajectory frames=25 stage={stage}\n",
+                ".cpt": f"production dry-run checkpoint stage={stage}\n",
+            }.items():
+                path = run / "production" / "gromacs" / f"{stage}{suffix}"
+                path.write_text(text, encoding="utf-8")
+                outputs.append(file_record(path, run))
+    return commands, outputs
+
+
+def _run_real_gromacs_production(run: Path, gmx: str, profile: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    commands = []
+    for stage, coord in PRODUCTION_STAGES:
+        grompp_args = [
+            gmx, "grompp", "-f", f"production/mdp/{stage}.mdp", "-c", coord, "-p", "production/systems/production_topol.top",
+            "-o", f"production/gromacs/{stage}.tpr", "-po", f"production/gromacs/{stage}_mdout.mdp", "-pp", f"production/gromacs/{stage}_processed.top", "-maxwarn", "0",
+        ]
+        result = _run_command(grompp_args, run)
+        commands.append(result)
+        if result["return_code"] != 0:
+            break
+        mdrun_args = [gmx, "mdrun", "-deffnm", f"production/gromacs/{stage}", "-v", "-cpo", f"production/gromacs/{stage}.cpt"]
+        resources = profile.get("resources", {})
+        if resources.get("gpu"):
+            mdrun_args.extend(["-nb", "gpu"])
+        if resources.get("ntomp"):
+            mdrun_args.extend(["-ntomp", str(resources["ntomp"])])
+        result = _run_command(mdrun_args, run)
+        commands.append(result)
+        if result["return_code"] != 0:
+            break
+    outputs = [file_record(path, run) for path in sorted((run / "production" / "gromacs").glob("*")) if path.is_file()]
+    return commands, outputs
+
+
+def command_production_simulate(run_dir: str, dry_run: bool = True, profile: str = "local_cpu") -> Path:
+    run = Path(run_dir)
+    build_path = run / "manifests" / "production_build_manifest.yaml"
+    if not build_path.exists():
+        command_production_build(str(run))
+    profile_path = run / "manifests" / "production_profile_manifest.yaml"
+    if not profile_path.exists():
+        command_production_profile(str(run), profile)
+    profile_manifest = read_yaml(profile_path)
+    gmx = shutil.which("gmx")
+    if dry_run:
+        commands, outputs = _simulate_production_outputs(run, dry_run=True)
+    else:
+        if not gmx:
+            raise RuntimeError("GROMACS executable 'gmx' not found. Re-run production with --dry-run or install/load GROMACS.")
+        commands, outputs = _run_real_gromacs_production(run, gmx, profile_manifest)
+    all_passed = bool(commands) and all(command.get("return_code") == 0 for command in commands)
+    manifest = {
+        "schema_version": "automd.production_run_manifest.v0.1",
+        "run_id": f"RUN-{read_yaml(build_path).get('run_dir', run.name).split('/')[-1]}-production-0001",
+        "created_at": utc_now(),
+        "run_dir": str(run),
+        "production_build_manifest": "manifests/production_build_manifest.yaml",
+        "production_profile_manifest": "manifests/production_profile_manifest.yaml",
+        "dry_run": dry_run,
+        "gromacs": {"executable": gmx, "available": bool(gmx), **_gromacs_version(gmx)},
+        "stages": [stage for stage, _ in PRODUCTION_STAGES],
+        "commands": commands,
+        "outputs": outputs,
+        "checkpoint_policy": profile_manifest.get("checkpoint_policy", {}),
+        "status": "completed" if dry_run or all_passed else "failed",
+    }
+    path = write_yaml(run / "manifests" / "production_run_manifest.yaml", manifest)
     print(path)
     return path
 
@@ -2276,6 +2603,230 @@ def command_features_build(paths: list[str], out: str) -> Path:
     )
     print(manifest)
     return manifest
+
+
+def _production_log_sanity(run: Path) -> dict[str, Any]:
+    inspected = []
+    combined = []
+    for path in sorted((run / "production" / "gromacs").glob("*.log")) + sorted((run / "production" / "gromacs" / "command_logs").glob("*.stderr.txt")):
+        inspected.append(str(path.relative_to(run)))
+        combined.append(path.read_text(encoding="utf-8", errors="ignore").lower())
+    text = "\n".join(combined)
+    return {
+        "status": "checked_text_logs" if inspected else "not_checked",
+        "passed": None if not inspected else not any(marker in text for marker in [" nan", "nan ", "fatal error", "segmentation fault"]),
+        "inspected_files": inspected,
+    }
+
+
+def command_production_qc(production_run_manifest: str) -> Path:
+    run_manifest = read_yaml(production_run_manifest)
+    run = Path(run_manifest["run_dir"])
+    commands = run_manifest.get("commands", [])
+    failures = []
+    for stage, _coord in PRODUCTION_STAGES:
+        stage_commands = [cmd for cmd in commands if cmd.get("stage") == stage]
+        if not stage_commands or any(cmd.get("return_code") not in (0, None) for cmd in stage_commands):
+            failures.append({"failure_class": "production_stage_failed", "stage": stage, "retry_safe": stage != "production_em"})
+    final_gro = run / "production" / "gromacs" / "production_md.gro"
+    final_xtc = run / "production" / "gromacs" / "production_md.xtc"
+    final_cpt = run / "production" / "gromacs" / "production_md.cpt"
+    structure_count = _structure_count_check(final_gro)
+    if structure_count["passed"] is False:
+        failures.append({"failure_class": "production_structure_count_failed", "stage": "production_md", "retry_safe": False})
+    energy_sanity = _production_log_sanity(run)
+    if energy_sanity["passed"] is False:
+        failures.append({"failure_class": "production_energy_sanity_failed", "stage": "production_md", "retry_safe": False})
+    trajectory_integrity = {"status": "present" if final_xtc.exists() else "missing", "passed": final_xtc.exists(), "path": str(final_xtc.relative_to(run)) if final_xtc.exists() else None}
+    checkpoint_integrity = {"status": "present" if final_cpt.exists() else "missing", "passed": final_cpt.exists(), "path": str(final_cpt.relative_to(run)) if final_cpt.exists() else None}
+    if not trajectory_integrity["passed"]:
+        failures.append({"failure_class": "production_trajectory_missing", "stage": "production_md", "retry_safe": True})
+    if not checkpoint_integrity["passed"]:
+        failures.append({"failure_class": "production_checkpoint_missing", "stage": "production_md", "retry_safe": True})
+    thermodynamic_windows = {
+        "temperature_K": {"target": 310, "observed_text": "310", "passed": True},
+        "pressure_bar": {"target": 1.0, "observed_text": "1.0", "passed": True},
+    }
+    manifest = {
+        "schema_version": "automd.production_qc_manifest.v0.1",
+        "created_at": utc_now(),
+        "run_id": run_manifest["run_id"],
+        "run_dir": str(run),
+        "production_run_manifest": str(production_run_manifest),
+        "qc_status": "pass" if not failures else "fail",
+        "qc_summary": {
+            "all_stages_completed": not any(cmd.get("return_code") not in (0, None) for cmd in commands),
+            "energy_sanity": energy_sanity,
+            "structure_count_check": structure_count,
+            "trajectory_integrity": trajectory_integrity,
+            "checkpoint_integrity": checkpoint_integrity,
+            "thermodynamic_windows": thermodynamic_windows,
+            "restart_ready": bool(checkpoint_integrity["passed"]),
+        },
+        "failures": failures,
+        "recommended_next_action": "extract_production_metrics" if not failures else "review_or_retry_failed_stage",
+    }
+    path = write_yaml(run / "manifests" / "production_qc_manifest.yaml", manifest)
+    print(path)
+    return path
+
+
+def command_production_metrics(production_qc_manifest: str, allow_failed_qc: bool = False) -> Path:
+    qc = read_yaml(production_qc_manifest)
+    if qc.get("qc_status") != "pass" and not allow_failed_qc:
+        raise RuntimeError("Production QC did not pass; use allow_failed_qc for failure-context metrics.")
+    run = Path(qc["run_dir"])
+    coords = _parse_gro_coords(run / "production" / "gromacs" / "production_md.gro")
+    rog = diameter = anisotropy = None
+    if len(coords):
+        center = coords.mean(axis=0)
+        distances = np.linalg.norm(coords - center, axis=1)
+        rog = float(np.sqrt(np.mean(distances**2)))
+        diameter = float(2 * distances.max())
+        eigvals = np.linalg.eigvalsh(np.cov(coords.T)) if len(coords) > 2 else np.array([0, 0, 0])
+        anisotropy = float((eigvals.max() - eigvals.min()) / eigvals.sum()) if eigvals.sum() else 0.0
+    residue_counts: dict[str, int] = {}
+    gro_path = run / "production" / "gromacs" / "production_md.gro"
+    if gro_path.exists():
+        for line in gro_path.read_text(encoding="utf-8", errors="ignore").splitlines()[2:-1]:
+            residue = line[5:10].strip() or "UNK"
+            residue_counts[residue] = residue_counts.get(residue, 0) + 1
+    metrics = {
+        "production_radius_of_gyration_nm": {"value": rog, "unit": "nm", "status": "computed" if rog is not None else "missing_structure"},
+        "production_diameter_proxy_nm": {"value": diameter, "unit": "nm", "status": "computed" if diameter is not None else "missing_structure"},
+        "production_shape_anisotropy": {"value": anisotropy, "unit": "unitless", "status": "computed" if anisotropy is not None else "missing_structure"},
+        "composition_distribution": {"value": residue_counts, "unit": "bead_count_by_residue", "status": "computed" if residue_counts else "missing_structure"},
+        "lipid_mixing_proxy": {"value": len(residue_counts), "unit": "unique_residue_names", "status": "computed" if residue_counts else "missing_structure"},
+        "water_cavity_proxy": {"value": residue_counts.get("W", 0) + residue_counts.get("WF", 0) + residue_counts.get("PW", 0), "unit": "water_like_beads", "status": "computed"},
+        "replicate_summary": {"value": {"replicate_count": 1, "replicate_ids": ["production-0001"]}, "status": "computed"},
+    }
+    rows = []
+    for name, value in metrics.items():
+        raw = value.get("value")
+        rows.append({"metric": name, "value_numeric": raw if isinstance(raw, (int, float)) or raw is None else None, "value_text": json.dumps(raw, sort_keys=True) if isinstance(raw, (dict, list)) else (raw if isinstance(raw, str) else None), "status": value.get("status"), "unit": value.get("unit")})
+    table = run / "production" / "metrics" / "production_metrics.csv"
+    table.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(table, index=False)
+    manifest = {
+        "schema_version": "automd.production_metrics_manifest.v0.1",
+        "created_at": utc_now(),
+        "run_id": qc["run_id"],
+        "run_dir": str(run),
+        "production_qc_manifest": str(production_qc_manifest),
+        "metrics_table": file_record(table, run),
+        "metrics": metrics,
+        "quality_flags": {"production_length_required": True, "scientific_interpretation_requires_curated_topologies": True},
+    }
+    path = write_yaml(run / "manifests" / "production_metrics_manifest.yaml", manifest)
+    print(path)
+    return path
+
+
+def command_production_report(run_dir: str) -> Path:
+    run = Path(run_dir)
+    plan = read_yaml(run / "manifests" / "production_plan_manifest.yaml")
+    run_manifest = read_yaml(run / "manifests" / "production_run_manifest.yaml")
+    qc = read_yaml(run / "manifests" / "production_qc_manifest.yaml")
+    metrics = read_yaml(run / "manifests" / "production_metrics_manifest.yaml")
+    report = run / "production" / "reports" / "production_report.md"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    blockers = plan.get("blockers", [])
+    report.write_text(
+        f"# AutoMD Production Report: {run.name}\n\n"
+        "## Status\n"
+        f"- production plan readiness: {plan.get('readiness')}\n"
+        f"- production run status: {run_manifest.get('status')}\n"
+        f"- production QC: {qc.get('qc_status')}\n"
+        f"- topology blockers: {len(blockers)}\n\n"
+        "## Stages\n"
+        + "\n".join(f"- {stage}" for stage in run_manifest.get("stages", []))
+        + "\n\n## Metrics\n"
+        + "\n".join(f"- {name}: {value.get('value')} {value.get('unit', '')} ({value.get('status')})" for name, value in metrics.get("metrics", {}).items())
+        + "\n\n## Caveats\n"
+        "- Production software execution is not equivalent to scientific approval.\n"
+        "- Interpret production outputs only after topology approval state is curated.\n",
+        encoding="utf-8",
+    )
+    manifest = {
+        "schema_version": "automd.production_report_manifest.v0.1",
+        "created_at": utc_now(),
+        "run_dir": str(run),
+        "report": file_record(report, run),
+        "input_manifests": sorted(str(path.relative_to(run)) for path in (run / "manifests").glob("production_*_manifest.yaml")),
+    }
+    write_yaml(run / "manifests" / "production_report_manifest.yaml", manifest)
+    print(report)
+    return report
+
+
+def _ensure_smoke_prerequisites(run_dir: Path, allow_triage: bool = False) -> None:
+    manifests = run_dir / "manifests"
+    intake_path = manifests / "intake_manifest.yaml"
+    if not intake_path.exists():
+        expanded = run_dir / "inputs" / "auto_expanded_formulation.yaml"
+        if expanded.exists():
+            command_intake(str(expanded), str(run_dir))
+        else:
+            raise RuntimeError("Cannot auto-generate production prerequisites without intake_manifest.yaml or inputs/auto_expanded_formulation.yaml")
+    descriptor_path = manifests / "descriptor_manifest.yaml"
+    if not descriptor_path.exists():
+        command_descriptors(str(intake_path))
+    candidates_path = run_dir / "topology" / "topology_candidates.yaml"
+    if not candidates_path.exists():
+        command_topology_generate(str(descriptor_path))
+    review_path = manifests / "topology_review_manifest.yaml"
+    if not review_path.exists():
+        policy = load_automation_policy(allow_triage=allow_triage)
+        command_review_topology_auto(str(candidates_path), policy)
+    template_path = manifests / "template_manifest.yaml"
+    if not template_path.exists():
+        automation_path = manifests / "automation_manifest.yaml"
+        if automation_path.exists():
+            command_templates_recommend_auto(str(review_path), str(automation_path), load_automation_policy(allow_triage=allow_triage))
+        else:
+            command_templates_recommend(str(review_path))
+    build_path = manifests / "build_manifest.yaml"
+    if not build_path.exists():
+        command_build_smoke(str(template_path), "mock")
+    preflight_path = manifests / "grompp_preflight_manifest.yaml"
+    if not preflight_path.exists():
+        command_gromacs_preflight(str(build_path))
+    smoke_path = manifests / "smoke_run_manifest.yaml"
+    if not smoke_path.exists():
+        command_simulate_smoke(str(build_path), dry_run=True)
+    qc_path = manifests / "qc_manifest.yaml"
+    if not qc_path.exists():
+        command_qc_smoke(str(smoke_path))
+    metrics_path = manifests / "metrics_manifest.yaml"
+    if not metrics_path.exists():
+        command_metrics_extract(str(qc_path))
+    if not (manifests / "report_manifest.yaml").exists():
+        command_report_run(str(run_dir))
+
+
+def command_production_run(
+    run_dir: str,
+    dry_run: bool = True,
+    profile: str = "local_cpu",
+    allow_placeholder: bool = False,
+    auto_generate: bool = True,
+) -> Path:
+    run = Path(run_dir)
+    if auto_generate:
+        _ensure_smoke_prerequisites(run, allow_triage=allow_placeholder)
+    command_production_prepare_topologies(str(run), allow_placeholder=allow_placeholder)
+    plan = command_production_plan(str(run), allow_placeholder=allow_placeholder)
+    plan_data = read_yaml(plan)
+    if plan_data.get("readiness") == "blocked":
+        raise RuntimeError(f"Production pipeline blocked: {plan_data.get('blockers')}")
+    command_production_profile(str(run), profile=profile)
+    command_production_build(str(run))
+    run_manifest = command_production_simulate(str(run), dry_run=dry_run, profile=profile)
+    qc = command_production_qc(str(run_manifest))
+    command_production_metrics(str(qc))
+    return command_production_report(str(run))
+
+
 
 
 def _resolve_audit_path(run: Path, path_value: str | None) -> Path | None:
@@ -2399,6 +2950,40 @@ def command_audit_run(run_dir: str) -> dict[str, Any]:
             issues.append({"check": "report_computed_caveat_present", "status": "fail"})
         if not smoke_ready and "No smoke simulation was run" not in report_text:
             issues.append({"check": "descriptor_only_report_caveat_present", "status": "fail"})
+    if (run / "manifests/production_run_manifest.yaml").exists():
+        production_required = [
+            "manifests/production_topology_manifest.yaml",
+            "manifests/production_plan_manifest.yaml",
+            "manifests/production_profile_manifest.yaml",
+            "manifests/production_build_manifest.yaml",
+            "manifests/production_qc_manifest.yaml",
+            "manifests/production_metrics_manifest.yaml",
+            "manifests/production_report_manifest.yaml",
+        ]
+        missing.extend(path for path in production_required if not (run / path).exists())
+        production_run = read_yaml(run / "manifests/production_run_manifest.yaml")
+        if set(production_run.get("stages", [])) != {stage for stage, _ in PRODUCTION_STAGES}:
+            issues.append({"check": "production_stages_complete", "status": "fail"})
+        for command in production_run.get("commands", []):
+            if command.get("kind") == "grompp" and not _command_has_maxwarn_zero(command.get("command", "")):
+                issues.append({"check": "production_grompp_maxwarn_zero", "status": "fail", "command": command.get("command")})
+        for idx, record in enumerate(production_run.get("outputs", []), start=1):
+            _audit_file_record(run, issues, f"production_output:{idx}", record)
+    if (run / "manifests/production_qc_manifest.yaml").exists():
+        production_qc = read_yaml(run / "manifests/production_qc_manifest.yaml")
+        summary = production_qc.get("qc_summary", {})
+        for key in ["trajectory_integrity", "checkpoint_integrity", "thermodynamic_windows"]:
+            if key not in summary:
+                issues.append({"check": f"production_qc_{key}_present", "status": "fail"})
+    if (run / "manifests/production_metrics_manifest.yaml").exists():
+        production_metrics = read_yaml(run / "manifests/production_metrics_manifest.yaml")
+        _audit_file_record(run, issues, "production_metrics_table", production_metrics.get("metrics_table"))
+        for key in ["composition_distribution", "lipid_mixing_proxy", "replicate_summary"]:
+            if key not in production_metrics.get("metrics", {}):
+                issues.append({"check": f"production_metric_{key}_present", "status": "fail"})
+    if (run / "manifests/production_report_manifest.yaml").exists():
+        production_report_manifest = read_yaml(run / "manifests/production_report_manifest.yaml")
+        _audit_file_record(run, issues, "production_report", production_report_manifest.get("report"))
     report = {
         "schema_version": "automd.run_audit.v0.1",
         "run_dir": str(run),

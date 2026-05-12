@@ -109,6 +109,22 @@ def build_parser() -> argparse.ArgumentParser:
     production_plan = production_sub.add_parser("plan")
     production_plan.add_argument("run_dir")
     production_plan.add_argument("--out")
+    production_plan.add_argument("--allow-placeholder", action="store_true")
+    production_run = production_sub.add_parser("run")
+    production_run.add_argument("run_dir")
+    production_run.add_argument("--dry-run", action="store_true")
+    production_run.add_argument("--real-gromacs", action="store_true")
+    production_run.add_argument("--profile", default="local_cpu")
+    production_run.add_argument("--allow-placeholder", action="store_true")
+    production_run.add_argument("--no-auto-generate", action="store_true")
+    production_build = production_sub.add_parser("build")
+    production_build.add_argument("run_dir")
+    production_qc = production_sub.add_parser("qc")
+    production_qc.add_argument("production_run_manifest")
+    production_metrics = production_sub.add_parser("metrics")
+    production_metrics.add_argument("production_qc_manifest")
+    production_report = production_sub.add_parser("report")
+    production_report.add_argument("run_dir")
 
     features = sub.add_parser("features")
     features_sub = features.add_subparsers(dest="features_cmd")
@@ -193,7 +209,17 @@ def main(argv: list[str] | None = None) -> int:
         elif args.cmd == "prioritize":
             core.command_prioritize(args.manifests, args.out)
         elif args.cmd == "production" and args.production_cmd == "plan":
-            core.command_production_plan(args.run_dir, args.out)
+            core.command_production_plan(args.run_dir, args.out, args.allow_placeholder)
+        elif args.cmd == "production" and args.production_cmd == "run":
+            core.command_production_run(args.run_dir, dry_run=not args.real_gromacs or args.dry_run, profile=args.profile, allow_placeholder=args.allow_placeholder, auto_generate=not args.no_auto_generate)
+        elif args.cmd == "production" and args.production_cmd == "build":
+            core.command_production_build(args.run_dir)
+        elif args.cmd == "production" and args.production_cmd == "qc":
+            core.command_production_qc(args.production_run_manifest)
+        elif args.cmd == "production" and args.production_cmd == "metrics":
+            core.command_production_metrics(args.production_qc_manifest)
+        elif args.cmd == "production" and args.production_cmd == "report":
+            core.command_production_report(args.run_dir)
         elif args.cmd == "features" and args.features_cmd == "build":
             core.command_features_build(args.paths, args.out)
         elif args.cmd == "batch" and args.batch_cmd == "plan":
